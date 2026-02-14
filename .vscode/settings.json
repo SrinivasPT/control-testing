@@ -1,0 +1,87 @@
+{
+    // --- GENERAL EDITOR SETTINGS ---
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.fixAll": "explicit",
+        "source.organizeImports": "always"
+    },
+    "editor.rulers": [140, 140],
+
+    // --- JAVA SETTINGS ---
+    "[java]": {
+        "editor.defaultFormatter": "redhat.java",
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        }
+    },
+    // Java Extension Pack Settings
+    "java.format.settings.url": "https://raw.githubusercontent.com/google/styleguide/gh-pages/eclipse-java-google-style.xml",
+    "java.format.settings.profile": "GoogleStyle",
+    "java.compile.nullAnalysis.mode": "automatic",
+    "java.configuration.runtimes": [
+        {
+            "name": "JavaSE-21",
+            "default": true
+        }
+    ],
+    // Spring Boot Settings
+    "java.jdt.ls.java.home": "", // Set to your JDK 21 path if needed
+
+    // --- PYTHON SETTINGS (RUFF) ---
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit",
+            "source.organizeImports": "explicit"
+        }
+    },
+    "ruff.enable": true,
+    "ruff.organizeImports": true,
+
+    // --- WEB SETTINGS (PRETTIER) ---
+    "[javascript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[typescript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[typescriptreact]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[javascriptreact]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[json]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[jsonc]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[html]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[css]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "prettier.requireConfig": false,
+    "typescript.preferences.importModuleSpecifier": "non-relative",
+
+    // --- SQL SERVER SETTINGS ---
+    "[sql]": {
+        "editor.defaultFormatter": "ms-mssql.mssql",
+        "editor.formatOnSave": true
+    },
+    "mssql.format.alignColumnDefinitionsInColumns": true,
+    "mssql.format.keywordCase": "upper",
+    "mssql.format.datatypeCasing": "upper",
+
+    // --- GIT & SEARCH ---
+    "files.exclude": {
+        "**/.git": true,
+        "**/node_modules": true,
+        "**/target": true,
+        "**/.venv": true,
+        "**/__pycache__": true
+    },
+    "search.exclude": {
+        "**/node_modules": true,
+        "**/target": true,
+        "**/.venv": true,
+        "**/dist": true
+    },
+    "git.ignoreLimitWarning": true,
+
+    // --- INTELLISENSE & PERFORMANCE ---
+    "files.watcherExclude": {
+        "**/target/**": true,
+        "**/node_modules/**": true,
+        "**/.venv/**": true
+    },
+    "editor.suggest.preview": true,
+    "editor.inlineSuggest.enabled": true,
+    "java.configuration.updateBuildConfiguration": "automatic"
+}

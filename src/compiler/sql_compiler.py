@@ -118,14 +118,19 @@ class ControlCompiler:
 
                 on_clause = " AND ".join(join_conditions)
 
-                # CRITICAL FIX: Use DuckDB's EXCLUDE to prevent Ambiguous Column crashes
-                # When both tables have the same column names (like join keys), we exclude
-                # the duplicate columns from the right table to avoid SQL errors
+                # CRITICAL FIX: Namespace the aliased keys with step_id to prevent collisions in chained joins.
+                # When multiple joins use the same key (e.g., employee_id), a generic "right_employee_id" would
+                # be created multiple times, causing DuckDB to crash with "Duplicate Column Name".
+                # By using step_id (e.g., "join_service_tickets_employee_id"), each join gets a unique alias.
                 exclude_keys = ", ".join(action.right_keys)
+                aliased_keys = ", ".join(
+                    [f"right_tbl.{k} AS {step.step_id}_{k}" for k in action.right_keys]
+                )
 
                 join_cte = f"""{step.step_id} AS (
     SELECT {previous_alias}.*,
-           right_tbl.* EXCLUDE ({exclude_keys})
+           right_tbl.* EXCLUDE ({exclude_keys}),
+           {aliased_keys}
     FROM {previous_alias}
     LEFT JOIN read_parquet('{right_path}') AS right_tbl
     ON {on_clause}
@@ -170,28 +175,30 @@ class ControlCompiler:
             if isinstance(assertion, ValueMatchAssertion):
                 # Row-level assertion → WHERE clause
                 cond = self._compile_value_match(assertion)
-                # Wrap in NOT to find exceptions
-                self.assertion_exceptions.append(f"NOT ({cond})")
+                # CRITICAL FIX: Use IS NOT TRUE instead of NOT to handle NULL properly
+                # NOT (NULL) = NULL (drops row from result), but (NULL) IS NOT TRUE = TRUE (catches the exception)
+                self.assertion_exceptions.append(f"({cond}) IS NOT TRUE")
 
             elif isinstance(assertion, TemporalSequenceAssertion):
                 # Temporal sequence → WHERE clause
                 cond = self._compile_temporal_sequence(assertion)
-                self.assertion_exceptions.append(f"NOT ({cond})")
+                self.assertion_exceptions.append(f"({cond}) IS NOT TRUE")
 
             elif isinstance(assertion, TemporalDateMathAssertion):
                 # Temporal date math → WHERE clause
                 cond = self._compile_temporal_date_math(assertion)
-                self.assertion_exceptions.append(f"NOT ({cond})")
+                self.assertion_exceptions.append(f"({cond}) IS NOT TRUE")
 
             elif isinstance(assertion, ColumnComparisonAssertion):
                 # Column-to-column comparison → WHERE clause
                 cond = self._compile_column_comparison(assertion)
-                self.assertion_exceptions.append(f"NOT ({cond})")
+                self.assertion_exceptions.append(f"({cond}) IS NOT TRUE")
 
             elif isinstance(assertion, (AggregationSumAssertion, AggregationAssertion)):
                 # Aggregation assertion → HAVING clause
                 cond = self._compile_aggregation(assertion)
-                self.having_conditions.append(f"NOT ({cond})")
+                # For aggregations, also use IS NOT TRUE for consistency
+                self.having_conditions.append(f"({cond}) IS NOT TRUE")
                 # Normalize group_by_fields to strip dataset prefixes
                 normalized_fields = [
                     self._normalize_field_name(f) for f in assertion.group_by_fields

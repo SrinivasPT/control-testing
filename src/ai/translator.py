@@ -119,6 +119,33 @@ CRITICAL RULES:
     - This handles variations like "APPROVED" vs "Approved" vs " approved "
     - Only set to false if exact case matching is required
 
+14. **CRITICAL - Filter vs. Assertion Trap (MUST READ):**
+    - The Population pipeline determines WHO gets tested. Assertions determine WHO passes.
+    - If a missing record or NULL value is considered an audit violation, you MUST put the IS NOT NULL check in the Assertions block, NOT in the Population pipeline.
+    - Example BAD: Putting "filter_is_null: false on assessment_status" in Population - this silently excludes vendors without assessments!
+    - Example GOOD: Put "value_match: assessment_status IS NOT NULL" in Assertions - this catches vendors missing assessments as failures.
+    - The Population pipeline is ONLY for scoping the dataset (e.g., "only check ACTIVE contracts"), never for passing/failing records.
+
+15. **CRITICAL - Right-Side Join Key Checking:**
+    - After a LEFT JOIN, ONLY the right-side JOIN KEYS are aliased with a "{{step_id}}_" prefix.
+    - To check if a LEFT JOIN successfully matched, use: {{step_id}}_{{join_key}} IS NOT NULL
+    - To check if a LEFT JOIN failed to match (anti-join pattern), use: {{step_id}}_{{join_key}} IS NULL
+    - For ALL OTHER columns from the right table (non-key fields), use the column name WITHOUT any prefix
+    - Example: After joining personal_trade_blotter to wall_cross_register (step_id: "join_wall_cross_register") on employee_id and ticker_symbol:
+      * Use "join_wall_cross_register_employee_id IS NOT NULL" to verify the join matched
+      * Use "restriction_status" (NOT "join_wall_cross_register_restriction_status") to check the actual restriction status field
+    - Example: After joining hr_terminations to system_accounts (step_id: "join_system_accounts") on employee_id:
+      * Use "join_system_accounts_employee_id IS NULL" to verify the employee does NOT exist in system_accounts
+
+16. **CRITICAL - Handling IF/THEN Conditional Logic:**
+    - If a control contains conditional logic (e.g., "If status is X, then verify Y"), you MUST decompose it:
+      * The "IF" portion becomes a FilterComparison step in the Population pipeline to isolate target rows
+      * The "THEN" portion becomes assertions in the Assertions array
+    - Example: "If reconciliation_status is MISMATCH, then verify bref_raised_flag = Y and resolution within 30 days"
+      * Population Filter: reconciliation_status = 'MISMATCH'
+      * Assertion 1: bref_raised_flag = 'Y'
+      * Assertion 2: TemporalDateMath(resolution_date <= application_date + 30)
+
 ALLOWED OPERATORS:
 - Filter: eq, neq, gt, lt, gte, lte
 - ValueMatch: eq, neq, gt, lt, gte, lte, in, not_in

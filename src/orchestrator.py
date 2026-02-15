@@ -266,8 +266,25 @@ class BatchOrchestrator:
             # Generate DSL via AI (only sees headers, never row data)
             logger.info(f"Calling AI translator for control {control_id}")
             print("   🤖 Calling AI translator (model: deepseek-chat)...")
-            dsl = self.ai.translate_control(control_text, headers)
-            logger.info(f"AI translation completed successfully for {control_id}")
+
+            try:
+                dsl = self.ai.translate_control(control_text, headers)
+                logger.info(f"AI translation completed successfully for {control_id}")
+            except Exception as e:
+                # Catch ValidationError and other AI translation failures
+                logger.error(
+                    f"AI translation failed for {control_id}: {type(e).__name__}: {str(e)}",
+                    exc_info=True,
+                )
+                print(f"   ❌ AI translation failed: {type(e).__name__}")
+                print(f"   Details: {str(e)[:200]}...")
+                # Return error result so we can track which controls failed
+                return {
+                    "project_name": project_name,
+                    "control_id": control_id,
+                    "verdict": "ERROR",
+                    "error": f"AI translation failed: {type(e).__name__}: {str(e)[:200]}",
+                }
 
             # Override control_id if AI hallucinated
             dsl.governance.control_id = control_id

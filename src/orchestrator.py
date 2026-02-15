@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 
 from src.ai.translator import AITranslator
+from src.ai.validator import AIValidator
 from src.execution.engine import ExecutionEngine
 from src.execution.ingestion import EvidenceIngestion
 from src.models.dsl import EnterpriseControlDSL
@@ -45,6 +46,7 @@ class BatchOrchestrator:
         use_mock_ai: bool = False,
         db_path: str = "data/audit.db",
         parquet_dir: str = "data/parquet",
+        enable_llm_validation: bool = False,
     ):
         """
         Initialize orchestrator with all layer dependencies.
@@ -53,11 +55,15 @@ class BatchOrchestrator:
             use_mock_ai: If True, skip real LLM calls (for testing)
             db_path: Path to SQLite audit database
             parquet_dir: Directory for Parquet storage
+            enable_llm_validation: If True, use LLM to validate DSL and SQL before execution (double-check)
         """
         logger.info("Initializing BatchOrchestrator")
         logger.debug(
-            f"Configuration: use_mock_ai={use_mock_ai}, db_path={db_path}, parquet_dir={parquet_dir}"
+            f"Configuration: use_mock_ai={use_mock_ai}, db_path={db_path}, "
+            f"parquet_dir={parquet_dir}, enable_llm_validation={enable_llm_validation}"
         )
+
+        self.enable_llm_validation = enable_llm_validation
 
         # Layer 1: AI Translator
         if use_mock_ai:
@@ -65,6 +71,7 @@ class BatchOrchestrator:
 
             logger.info("Using MockAITranslator (no API calls)")
             self.ai = MockAITranslator()
+            self.validator = None  # No validation in mock mode
         else:
             api_key = os.getenv("DEEPSEEK_API_KEY")
             if not api_key:
@@ -74,6 +81,14 @@ class BatchOrchestrator:
                 )
             logger.info("Initializing AITranslator with DeepSeek API")
             self.ai = AITranslator(api_key=api_key)
+
+            # Initialize validator if enabled
+            if enable_llm_validation:
+                logger.info("Initializing AIValidator for DSL/SQL validation")
+                self.validator = AIValidator(api_key=api_key)
+            else:
+                logger.debug("LLM validation disabled (performance mode)")
+                self.validator = None
 
         # Layer 3: Ingestion
         logger.debug("Initializing EvidenceIngestion layer")
@@ -231,6 +246,9 @@ class BatchOrchestrator:
         print("\n[3/5] 🧠 Checking for existing DSL in audit database...")
         dsl_dict = self.audit.get_control(control_id)
 
+        # Initialize headers dict for potential use in self-healing
+        headers: Dict[str, List[str]] = {}
+
         if dsl_dict:
             logger.info(
                 f"DSL found in database for {control_id}, version {dsl_dict['governance']['version']}"
@@ -300,6 +318,24 @@ class BatchOrchestrator:
             )
             print(f"   ✓ DSL generated and saved (version {dsl.governance.version})")
 
+        # Step 3.5: AI Self-Healing Preparation (store headers for potential healing)
+        # We need headers for heal_dsl() in case SQL validation fails later
+        if not dsl_dict:
+            # Headers were already extracted during generation, store them
+            self._cached_headers = headers
+        else:
+            # DSL was cached, extract headers now for potential healing
+            logger.debug("Extracting headers for potential self-healing loop")
+            self._cached_headers = {}
+            for excel in excel_files:
+                try:
+                    sheet_headers = self.ingestion.get_column_headers(str(excel))
+                    for sheet_name, cols in sheet_headers.items():
+                        dataset_alias = f"{excel.stem}_{sheet_name}".lower()
+                        self._cached_headers[dataset_alias] = cols
+                except Exception as e:
+                    logger.warning(f"Failed to extract headers from {excel.name}: {e}")
+
         # Step 4: Ingest Evidence (Excel → Parquet + SHA-256)
         logger.debug(f"Step 4/5: Ingesting Excel files to Parquet for {project_name}")
         print(
@@ -336,9 +372,151 @@ class BatchOrchestrator:
                 print(f"      ❌ Failed: {e}")
                 raise
 
-        # Step 5: Execute Deterministic Control Test
-        logger.debug(f"Step 5/5: Executing control test for {control_id}")
-        print("\n[5/5] ⚙️  Executing control via DuckDB SQL engine...")
+        # Step 5: Optional LLM Validation (Double-Check Layer)
+        if self.validator:
+            logger.debug(f"Step 5/7: LLM validation for {control_id}")
+            print("\n[5/7] 🔍 LLM Pre-Flight Validation (DSL & SQL Review)...")
+
+            # Compile DSL to SQL for validation
+            from src.compiler.sql_compiler import ControlCompiler
+
+            compiler = ControlCompiler(dsl)
+            sql = compiler.compile_to_sql(manifests)
+
+            try:
+                validation_results = self.validator.validate_full_pipeline(
+                    control_text, dsl, sql, manifests
+                )
+
+                dsl_report = validation_results["dsl_validation"]
+                sql_report = validation_results["sql_validation"]
+
+                # Log validation results
+                logger.info(
+                    f"LLM Validation: DSL={dsl_report.is_valid}, SQL={sql_report.is_valid}, "
+                    f"Critical Issues={validation_results['total_critical_issues']}"
+                )
+
+                print(
+                    f"   DSL Validation: {'✓ PASS' if dsl_report.is_valid else '⚠️ ISSUES FOUND'}"
+                )
+                print(
+                    f"   SQL Validation: {'✓ PASS' if sql_report.is_valid else '⚠️ ISSUES FOUND'}"
+                )
+
+                # Display critical issues
+                critical_issues = [
+                    issue
+                    for issue in dsl_report.issues + sql_report.issues
+                    if issue.severity == "CRITICAL"
+                ]
+
+                if critical_issues:
+                    print(f"\n   ⚠️  {len(critical_issues)} CRITICAL issue(s) detected:")
+                    for idx, issue in enumerate(critical_issues[:3], 1):
+                        print(
+                            f"      {idx}. [{issue.category}] {issue.message[:80]}..."
+                        )
+                        if issue.suggested_fix:
+                            print(f"         Fix: {issue.suggested_fix[:80]}...")
+
+                    if len(critical_issues) > 3:
+                        print(f"      ... and {len(critical_issues) - 3} more issues")
+
+                    logger.warning(
+                        f"LLM validator found {len(critical_issues)} critical issues - "
+                        f"proceeding to DuckDB validation (strict judge)"
+                    )
+                    print(
+                        "   ⚠️  Proceeding to DuckDB validation (strict judge will decide)"
+                    )
+                else:
+                    print("   ✓ No critical issues detected by LLM")
+
+            except Exception as e:
+                logger.error(
+                    f"LLM validation failed: {type(e).__name__}: {e}", exc_info=True
+                )
+                print(f"   ⚠️  LLM validation error: {str(e)[:80]}")
+                print("   Continuing to DuckDB validation...")
+
+        # Step 6: SQL Validation & Self-Healing Loop (Strict Judge)
+        step_num = "6/7" if self.validator else "5/6"
+        logger.debug(
+            f"Step {step_num}: DuckDB validation and self-healing for {control_id}"
+        )
+        print(f"\n[{step_num}] ✅ DuckDB EXPLAIN Validation (Strict Judge)...")
+
+        from src.compiler.sql_compiler import ControlCompiler
+
+        # Compile DSL to SQL (recompile if validator wasn't used, otherwise reuse from validation step)
+        if not self.validator:
+            compiler = ControlCompiler(dsl)
+            sql = compiler.compile_to_sql(manifests)
+        else:
+            # SQL was already compiled in the validation step above
+            compiler = ControlCompiler(dsl)
+            sql = compiler.compile_to_sql(manifests)
+
+        logger.debug(f"Compiled SQL length: {len(sql)} characters")
+
+        # Deterministic SQL dry-run (The Strict Judge)
+        is_valid, error_msg = self.engine.validate_sql_dry_run(sql)
+
+        # Conditional AI Self-Healing (Only if judge rejects)
+        if not is_valid:
+            logger.warning(f"DuckDB rejected the SQL query: {error_msg}")
+            print(f"   ⚠️  SQL validation failed: {error_msg[:100]}...")
+            print("   🔧 Triggering AI Self-Healing protocol...")
+
+            # Feed the exact error back to the AI
+            try:
+                dsl = self.ai.heal_dsl(dsl, error_msg, self._cached_headers)
+                logger.info(f"AI healing completed, recompiling SQL for {control_id}")
+                print("   ✓ AI corrected the DSL - recompiling SQL...")
+
+                # Recompile and re-validate
+                compiler = ControlCompiler(dsl)
+                sql = compiler.compile_to_sql(manifests)
+                is_valid, error_msg = self.engine.validate_sql_dry_run(sql)
+
+                if not is_valid:
+                    logger.error(
+                        f"Self-healing failed for {control_id}. Persistent error: {error_msg}"
+                    )
+                    print("   ❌ Self-healing failed. SQL still invalid.")
+                    raise RuntimeError(
+                        f"Self-healing failed. Persistent SQL Error: {error_msg}"
+                    )
+
+                logger.info(f"Self-healing successful for {control_id}")
+                print("   ✓ Second validation PASSED - SQL is now correct")
+
+                # Save the healed DSL to audit database
+                self.audit.save_control(
+                    dsl.model_dump(), approved_by="AI_SELF_HEALED_SYSTEM"
+                )
+
+            except Exception as healing_error:
+                logger.error(
+                    f"AI self-healing crashed for {control_id}: {healing_error}",
+                    exc_info=True,
+                )
+                print(f"   ❌ Self-healing crashed: {type(healing_error).__name__}")
+                return {
+                    "project_name": project_name,
+                    "control_id": control_id,
+                    "verdict": "ERROR",
+                    "error": f"Self-healing failed: {type(healing_error).__name__}: {str(healing_error)[:200]}",
+                }
+        else:
+            logger.info(f"SQL validation PASSED for {control_id}")
+            print("   ✓ SQL validation PASSED - query is correct")
+
+        # Step 7: Execute Deterministic Control Test
+        step_num = "7/7" if self.validator else "6/6"
+        logger.debug(f"Step {step_num}: Executing control test for {control_id}")
+        print(f"\n[{step_num}] ⚙️  Executing control via DuckDB SQL engine...")
         report = self.engine.execute_control(dsl, manifests)
         logger.info(
             f"Execution complete for {control_id}: verdict={report['verdict']}, "

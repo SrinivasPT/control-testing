@@ -141,33 +141,106 @@ class ExecutionEngine:
         compiler: ControlCompiler,
     ) -> int:
         """
-        Counts total rows in the population after filters but before assertions.
+        Counts total rows in the population after filters and joins but before assertions.
+
+        CRITICAL: Must use the same CTE chain as the main query since population_filters
+        may reference columns from joined datasets that don't exist in base dataset.
+
+        CRITICAL: Creates a fresh compiler instance to avoid state corruption from
+        reusing the same compiler that will be used for main query execution.
         """
         logger.debug(f"Getting population count for {dsl.governance.control_id}")
-        base_alias = dsl.population.base_dataset
-        base_path = manifests[base_alias]["parquet_path"]
-        logger.debug(f"Base dataset: {base_alias}, path: {base_path}")
-
-        # Use the strictly segregated population_filters from the updated compiler
-        if hasattr(compiler, "population_filters") and compiler.population_filters:
-            where_clause = " AND ".join(compiler.population_filters)
-            count_sql = (
-                f"SELECT COUNT(*) FROM read_parquet('{base_path}') WHERE {where_clause}"
-            )
-        else:
-            count_sql = f"SELECT COUNT(*) FROM read_parquet('{base_path}')"
 
         try:
+            # CRITICAL FIX: Create a fresh compiler instance to avoid CTE name collisions
+            # The compiler passed in will be used for the main query, so we can't modify its state
+            from src.compiler.sql_compiler import ControlCompiler
+
+            count_compiler = ControlCompiler(dsl)
+
+            # Build the CTE chain with this fresh compiler
+            final_cte_alias = count_compiler._build_population_cte(manifests)
+
+            # Build WHERE clause from population filters
+            if count_compiler.population_filters:
+                where_clause = " AND ".join(count_compiler.population_filters)
+                count_sql = f"""
+WITH {", ".join(count_compiler.cte_fragments)}
+SELECT COUNT(*) FROM {final_cte_alias}
+WHERE {where_clause}
+"""
+            else:
+                count_sql = f"""
+WITH {", ".join(count_compiler.cte_fragments)}
+SELECT COUNT(*) FROM {final_cte_alias}
+"""
+
+            logger.debug(f"Population count SQL: {count_sql}")
             result = self.conn.execute(count_sql).fetchone()
             count = result[0] if result is not None else 0
             logger.debug(f"Population count: {count}")
             return count
+
         except Exception as e:
-            # Log the error in production, fallback to manifest count
-            logger.warning(f"Failed to get population count, using manifest count: {e}")
+            # Log the error with full traceback for debugging
+            logger.error(
+                f"Failed to get population count: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            logger.debug(
+                f"Attempted SQL: {count_sql if 'count_sql' in locals() else 'Not generated'}"
+            )
+
+            # Fallback to base manifest count (may be inaccurate if filters/joins exist)
+            base_alias = dsl.population.base_dataset
             fallback_count = manifests[base_alias].get("row_count", 0)
-            logger.debug(f"Fallback count: {fallback_count}")
+            logger.warning(
+                f"Using fallback manifest count ({fallback_count}) - "
+                f"this may be inaccurate if joins or filters are present"
+            )
             return fallback_count
+
+    def validate_sql_dry_run(self, sql: str) -> tuple[bool, str]:
+        """
+        Deterministic SQL validation using DuckDB's EXPLAIN mechanism.
+        Forces DuckDB to parse and bind the query to Parquet schemas without executing.
+
+        This is the STRICT JUDGE that enforces correctness.
+        Returns False and the exact error message if SQL is invalid.
+
+        Args:
+            sql: The compiled SQL query to validate
+
+        Returns:
+            Tuple of (is_valid, error_message)
+            - (True, "Valid") if SQL is correct
+            - (False, error_message) if SQL has issues
+        """
+        logger.debug("Running SQL dry-run validation via EXPLAIN")
+        try:
+            # EXPLAIN triggers Parser (syntax) and Binder (schema) validation
+            # without executing the query over data
+            self.conn.execute(f"EXPLAIN {sql}")
+            logger.info("SQL dry-run validation PASSED")
+            return True, "Valid"
+
+        except duckdb.BinderException as e:
+            # Semantic error (e.g., column doesn't exist, ambiguous join)
+            error_msg = f"Binder Error: {str(e)}"
+            logger.warning(f"SQL validation failed: {error_msg}")
+            return False, error_msg
+
+        except duckdb.ParserException as e:
+            # Syntax error (e.g., missing parenthesis, invalid SQL)
+            error_msg = f"Parser Error: {str(e)}"
+            logger.warning(f"SQL validation failed: {error_msg}")
+            return False, error_msg
+
+        except Exception as e:
+            # Catch-all for other DuckDB errors
+            error_msg = f"DuckDB Validation Error: {type(e).__name__}: {str(e)}"
+            logger.warning(f"SQL validation failed: {error_msg}")
+            return False, error_msg
 
     def validate_schema(
         self, manifests: Dict[str, Dict[str, Any]], dsl: EnterpriseControlDSL

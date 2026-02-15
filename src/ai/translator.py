@@ -375,6 +375,93 @@ class AITranslator:
             )
             raise
 
+    def heal_dsl(
+        self,
+        original_dsl: EnterpriseControlDSL,
+        sql_error_msg: str,
+        evidence_headers: Dict[str, List[str]],
+    ) -> EnterpriseControlDSL:
+        """
+        AI Self-Healing: Only triggered when DuckDB rejects compiled SQL.
+
+        This is EXECUTION-GUIDED SELF-CORRECTION:
+        - The AI acts as a Junior Developer
+        - DuckDB is the strict judge that provides the stack trace
+        - We feed the exact error back to force a targeted fix
+
+        This preserves determinism because:
+        1. AI never decides pass/fail (DuckDB does)
+        2. AI only runs if deterministic validation fails
+        3. The error message provides concrete guidance
+
+        Args:
+            original_dsl: The DSL that generated invalid SQL
+            sql_error_msg: The exact DuckDB error message
+            evidence_headers: Available schema for reference
+
+        Returns:
+            Corrected EnterpriseControlDSL
+        """
+        logger.warning(
+            f"Triggering AI self-healing for control {original_dsl.governance.control_id}"
+        )
+        logger.debug(f"DuckDB error: {sql_error_msg}")
+
+        healing_prompt = f"""
+You are a SQL debugging assistant. Your previous DSL generated SQL that crashed the DuckDB execution engine.
+
+DUCKDB ERROR MESSAGE:
+{sql_error_msg}
+
+AVAILABLE SCHEMA:
+{json.dumps(evidence_headers, indent=2)}
+
+ORIGINAL BROKEN DSL:
+{original_dsl.model_dump_json(indent=2)}
+
+TASK:
+Identify why the SQL failed based on the error message (e.g., referencing a column that doesn't exist, 
+ambiguous column in a join, wrong data type). Return a corrected EnterpriseControlDSL JSON that resolves 
+this exact error.
+
+CRITICAL RULES:
+1. Only fix the specific issue mentioned in the error
+2. Use EXACT column names from the available schema
+3. For joins, ensure columns are properly qualified with dataset aliases
+4. Do NOT invent new operators or fields
+5. Return the FULL corrected DSL, not just the changed parts
+"""
+
+        try:
+            logger.debug("Calling LLM for DSL healing")
+            corrected_dsl = self.client.chat.completions.create(
+                model=self.model,
+                response_model=EnterpriseControlDSL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict compliance control compiler fixing a database error.",
+                    },
+                    {"role": "user", "content": healing_prompt},
+                ],
+                max_tokens=4000,
+                temperature=0.1,
+                max_retries=2,
+            )
+            logger.info(
+                f"AI self-healing completed for control {corrected_dsl.governance.control_id}"
+            )
+            return corrected_dsl
+
+        except Exception as e:
+            logger.error(
+                f"AI self-healing failed: {type(e).__name__}: {e}", exc_info=True
+            )
+            # Re-raise - if healing fails, we can't proceed
+            raise RuntimeError(
+                f"AI self-healing failed to fix DSL: {type(e).__name__}: {str(e)}"
+            ) from e
+
 
 class MockAITranslator:
     """
@@ -432,3 +519,18 @@ class MockAITranslator:
         }
 
         return EnterpriseControlDSL(**mock_dsl_dict)
+
+    def heal_dsl(
+        self,
+        original_dsl: EnterpriseControlDSL,
+        sql_error_msg: str,
+        evidence_headers: Dict[str, List[str]],
+    ) -> EnterpriseControlDSL:
+        """Mock healing: just return the original DSL (no real healing in mock mode)"""
+        logger.info("MockAITranslator.heal_dsl called (no real API calls)")
+        logger.debug(f"Mock healing for control: {original_dsl.governance.control_id}")
+        logger.debug(f"Error message: {sql_error_msg[:100]}...")
+
+        # In mock mode, we can't actually fix anything, so just return original
+        # In real tests, use a real AITranslator
+        return original_dsl

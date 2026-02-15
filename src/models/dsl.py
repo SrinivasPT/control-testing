@@ -63,6 +63,16 @@ class FilterInList(BaseModel):
     values: List[Union[str, int, float]]
 
 
+class FilterIsNull(BaseModel):
+    """Filter rows where a column IS NULL or IS NOT NULL"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["filter_is_null"] = "filter_is_null"
+    field: str
+    is_null: bool  # True for IS NULL, False for IS NOT NULL
+
+
 class JoinLeft(BaseModel):
     """Left join two datasets"""
 
@@ -77,7 +87,8 @@ class JoinLeft(BaseModel):
 
 # Unified Pipeline Action (Discriminated Union with proper Pydantic v2 syntax)
 PipelineAction = Annotated[
-    Union[FilterComparison, FilterInList, JoinLeft], Field(discriminator="operation")
+    Union[FilterComparison, FilterInList, FilterIsNull, JoinLeft],
+    Field(discriminator="operation"),
 ]
 
 
@@ -135,7 +146,7 @@ class ValueMatchAssertion(BaseAssertion):
     assertion_type: Literal["value_match"] = "value_match"
     field: str
     operator: Literal["eq", "neq", "gt", "lt", "gte", "lte", "in", "not_in"]
-    expected_value: Union[str, int, float, List[str], List[int]]
+    expected_value: Union[str, int, float, bool, None, List[str], List[int]]
 
 
 class TemporalSequenceAssertion(BaseAssertion):
@@ -149,7 +160,10 @@ class AggregationSumAssertion(BaseAssertion):
     """Aggregation-level assertion"""
 
     assertion_type: Literal["aggregation_sum"] = "aggregation_sum"
-    group_by_fields: List[str]
+    group_by_fields: List[str] = Field(
+        ...,
+        description="Columns to group by. MUST include the primary key if checking per-entity limits.",
+    )
     metric_field: str
     operator: Literal["gt", "lt", "eq", "gte", "lte"]
     threshold: float

@@ -3,16 +3,17 @@ SQL Compiler Module
 Translates DSL to DuckDB SQL with proper CTE chaining and value escaping
 """
 
-from typing import List, Dict, Any
 from datetime import datetime
+from typing import Any, Dict, List
+
 from src.models.dsl import (
-    EnterpriseControlDSL,
-    ValueMatchAssertion,
-    TemporalSequenceAssertion,
     AggregationSumAssertion,
+    EnterpriseControlDSL,
     FilterComparison,
     FilterInList,
-    JoinLeft,
+    FilterIsNull,
+    TemporalSequenceAssertion,
+    ValueMatchAssertion,
 )
 
 
@@ -21,7 +22,10 @@ class ControlCompiler:
 
     def __init__(self, dsl: EnterpriseControlDSL):
         self.dsl = dsl
-        self.where_conditions: List[str] = []
+        self.population_filters: List[str] = []  # MUST be true (AND)
+        self.assertion_exceptions: List[
+            str
+        ] = []  # If ANY are true, it's a failure (OR)
         self.having_conditions: List[str] = []
         self.group_by_fields: List[str] = []
         self.cte_fragments: List[str] = []
@@ -70,11 +74,15 @@ class ControlCompiler:
             if action.operation == "filter_comparison":
                 # Filters are applied in WHERE clause, not in CTE
                 cond = self._compile_filter_comparison(action)
-                self.where_conditions.append(cond)
+                self.population_filters.append(cond)
 
             elif action.operation == "filter_in_list":
                 cond = self._compile_filter_in_list(action)
-                self.where_conditions.append(cond)
+                self.population_filters.append(cond)
+
+            elif action.operation == "filter_is_null":
+                cond = self._compile_filter_is_null(action)
+                self.population_filters.append(cond)
 
             elif action.operation == "join_left":
                 right_path = manifests[action.right_dataset]["parquet_path"]
@@ -108,6 +116,13 @@ class ControlCompiler:
         values_str = ", ".join([self._quote_value(v) for v in action.values])
         return f"{action.field} IN ({values_str})"
 
+    def _compile_filter_is_null(self, action: FilterIsNull) -> str:
+        """Compiles FilterIsNull to SQL IS NULL condition"""
+        if action.is_null:
+            return f"{action.field} IS NULL"
+        else:
+            return f"{action.field} IS NOT NULL"
+
     def _compile_assertions(self) -> None:
         """Routes assertions to appropriate SQL clauses"""
         for assertion in self.dsl.assertions:
@@ -115,12 +130,12 @@ class ControlCompiler:
                 # Row-level assertion → WHERE clause
                 cond = self._compile_value_match(assertion)
                 # Wrap in NOT to find exceptions
-                self.where_conditions.append(f"NOT ({cond})")
+                self.assertion_exceptions.append(f"NOT ({cond})")
 
             elif isinstance(assertion, TemporalSequenceAssertion):
                 # Temporal sequence → WHERE clause
                 cond = self._compile_temporal_sequence(assertion)
-                self.where_conditions.append(f"NOT ({cond})")
+                self.assertion_exceptions.append(f"NOT ({cond})")
 
             elif isinstance(assertion, AggregationSumAssertion):
                 # Aggregation assertion → HAVING clause
@@ -180,19 +195,20 @@ class ControlCompiler:
         return f"SUM({metric}) {sql_op} {threshold}"
 
     def _build_sampling_clause(self) -> str:
-        """Builds sampling clause if enabled"""
+        """Builds DuckDB specific TABLESAMPLE clause"""
         if not self.dsl.population.sampling or not self.dsl.population.sampling.enabled:
             return ""
 
         sampling = self.dsl.population.sampling
+        seed_clause = (
+            f" REPEATABLE ({sampling.random_seed})" if sampling.random_seed else ""
+        )
 
         if sampling.sample_size:
-            # Absolute sample size
-            return f"\nUSING SAMPLE {sampling.sample_size} ROWS"
+            return f" TABLESAMPLE RESERVOIR({sampling.sample_size} ROWS){seed_clause}"
         elif sampling.sample_percentage:
-            # Percentage-based sampling
             pct = int(sampling.sample_percentage * 100)
-            return f"\nUSING SAMPLE {pct}%"
+            return f" TABLESAMPLE RESERVOIR({pct}%){seed_clause}"
 
         return ""
 
@@ -203,10 +219,18 @@ class ControlCompiler:
         # Build CTE chain
         cte_sql = "WITH " + ",\n".join(self.cte_fragments) if self.cte_fragments else ""
 
-        # Build WHERE clause
-        where_clause = (
-            " AND ".join(self.where_conditions) if self.where_conditions else "1=1"
+        # 1. Assemble Population Filters (AND)
+        pop_clause = (
+            " AND ".join(self.population_filters) if self.population_filters else "1=1"
         )
+
+        # 2. Assemble Exceptions (OR)
+        if self.assertion_exceptions:
+            exceptions_clause = " OR ".join(self.assertion_exceptions)
+            # Final WHERE: Must be in population, AND must break AT LEAST ONE rule
+            where_clause = f"({pop_clause}) \n  AND ({exceptions_clause})"
+        else:
+            where_clause = pop_clause
 
         # Build SELECT
         if self.having_conditions:

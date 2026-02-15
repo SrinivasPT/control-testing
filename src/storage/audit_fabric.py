@@ -3,11 +3,31 @@ Audit Fabric Module - SQLite Implementation
 Immutable storage for control DSLs, execution history, and evidence manifests
 """
 
-import sqlite3
 import json
+import sqlite3
 from datetime import datetime
-from typing import Dict, List, Any, Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """
+    Recursively converts pandas Timestamps and other non-JSON-serializable types
+    to JSON-compatible formats.
+    """
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(item) for item in obj]
+    elif pd.isna(obj):
+        return None
+    return obj
 
 
 class AuditFabric:
@@ -205,7 +225,7 @@ class AuditFabric:
                 report.get("exception_rate_percent"),
                 report["execution_query"],
                 json.dumps(report.get("evidence_hashes", {})),
-                json.dumps(report.get("exceptions_sample", [])),
+                json.dumps(_sanitize_for_json(report.get("exceptions_sample", []))),
                 report.get("error_message"),
                 report["executed_at"],
             ),

@@ -3,11 +3,13 @@ Execution Engine Module
 DuckDB-based execution with disk streaming
 """
 
-import duckdb
 from datetime import datetime
-from typing import Dict, Any
-from src.models.dsl import EnterpriseControlDSL
+from typing import Any, Dict
+
+import duckdb
+
 from src.compiler.sql_compiler import ControlCompiler
+from src.models.dsl import EnterpriseControlDSL
 
 
 class ExecutionEngine:
@@ -97,26 +99,20 @@ class ExecutionEngine:
         base_alias = dsl.population.base_dataset
         base_path = manifests[base_alias]["parquet_path"]
 
-        # Build count query with same filters
-        if compiler.where_conditions:
-            # Only apply filter conditions, not assertion conditions
-            filter_conditions = [
-                cond
-                for cond in compiler.where_conditions
-                if not cond.startswith("NOT (")
-            ]
-            if filter_conditions:
-                where_clause = " AND ".join(filter_conditions)
-                count_sql = f"SELECT COUNT(*) FROM read_parquet('{base_path}') WHERE {where_clause}"
-            else:
-                count_sql = f"SELECT COUNT(*) FROM read_parquet('{base_path}')"
+        # Use the strictly segregated population_filters from the updated compiler
+        if hasattr(compiler, "population_filters") and compiler.population_filters:
+            where_clause = " AND ".join(compiler.population_filters)
+            count_sql = (
+                f"SELECT COUNT(*) FROM read_parquet('{base_path}') WHERE {where_clause}"
+            )
         else:
             count_sql = f"SELECT COUNT(*) FROM read_parquet('{base_path}')"
 
         try:
-            return self.conn.execute(count_sql).fetchone()[0]
-        except:
-            # Fallback: use manifest row count
+            result = self.conn.execute(count_sql).fetchone()
+            return result[0] if result is not None else 0
+        except Exception:
+            # Log the error in production, fallback to manifest count
             return manifests[base_alias].get("row_count", 0)
 
     def validate_schema(

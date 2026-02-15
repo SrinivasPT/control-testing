@@ -3,13 +3,25 @@ AI Translation Module
 Schema pruning and DSL generation using OpenAI/Anthropic
 """
 
-import json
 import os
 from typing import Dict, List, Optional
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field
 
 from src.models.dsl import EnterpriseControlDSL
+
+
+# NEW: Define a strict Pydantic model for the Pruning Pass
+class PrunedSchema(BaseModel):
+    """Structured output for the schema pruning LLM pass"""
+
+    required_columns: List[str] = Field(
+        description="List of required columns in format 'dataset_alias.column_name'"
+    )
+    reasoning: str = Field(
+        description="Brief explanation of why these columns were selected"
+    )
+
 
 # System Prompts
 PRUNING_PROMPT = """You are a banking data architect.
@@ -74,7 +86,7 @@ If control says "Ensure all trades over $10k are approved":
 class AITranslator:
     """
     AI-powered DSL translator with schema pruning.
-    Supports OpenAI and Anthropic models via Instructor library.
+    Fully leverages Instructor for self-correction loops and guaranteed JSON.
     """
 
     def __init__(self, api_key: Optional[str] = None, model: str = "deepseek-chat"):
@@ -86,7 +98,7 @@ class AITranslator:
         except ImportError:
             raise ImportError(
                 "Instructor library not installed. "
-                "Run: pip install instructor openai anthropic"
+                "Run: pip install instructor openai pydantic"
             )
 
         # Initialize DeepSeek client with Instructor (OpenAI-compatible API)
@@ -97,6 +109,7 @@ class AITranslator:
                 "or pass api_key parameter."
             )
 
+        # Patch the OpenAI client with Instructor
         self.client = instructor.from_openai(
             OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1"),
             mode=instructor.Mode.JSON,
@@ -106,7 +119,7 @@ class AITranslator:
         self, control_text: str, evidence_headers: Dict[str, List[str]]
     ) -> EnterpriseControlDSL:
         """
-        Two-pass translation with automatic retry on validation failure.
+        Two-pass translation with Pydantic self-correction.
 
         Args:
             control_text: Plain English control procedure
@@ -115,31 +128,26 @@ class AITranslator:
         Returns:
             Validated EnterpriseControlDSL
         """
-        # Pass 1: Schema pruning
-        pruned_columns = self._prune_schema(control_text, evidence_headers)
+        # Pass 1: Schema pruning (Returns guaranteed Pydantic object)
+        pruned_schema_obj = self._prune_schema(control_text, evidence_headers)
 
-        # Pass 2: DSL generation with Pydantic validation
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                dsl = self._generate_dsl(control_text, pruned_columns, evidence_headers)
-                return dsl
-            except ValidationError:
-                pass  # Continue to next attempt
+        # Re-map the flat list back to dataset architecture
+        pruned_columns = {}
+        for col_ref in pruned_schema_obj.required_columns:
+            if "." in col_ref:
+                dataset, col = col_ref.split(".", 1)
+                if dataset not in pruned_columns:
+                    pruned_columns[dataset] = []
+                pruned_columns[dataset].append(col)
 
-        # If we reach here, all attempts failed
-        raise ValueError(f"Failed to generate valid DSL after {max_retries} attempts.")
+        # Pass 2: Generate DSL
+        # Instructor handles the retries and feeds validation errors back to the LLM automatically!
+        return self._generate_dsl(control_text, pruned_columns, evidence_headers)
 
     def _prune_schema(
         self, control_text: str, evidence_headers: Dict[str, List[str]]
-    ) -> Dict[str, List[str]]:
-        """
-        First LLM pass: Identify relevant columns.
-
-        Returns:
-            Dict mapping dataset_alias -> pruned column list
-        """
-        # Flatten all columns
+    ) -> PrunedSchema:
+        """First LLM pass: Identify relevant columns using strict Pydantic extraction."""
         all_columns = []
         for dataset, cols in evidence_headers.items():
             all_columns.extend([f"{dataset}.{col}" for col in cols])
@@ -148,38 +156,18 @@ class AITranslator:
             control_text=control_text, all_column_names=", ".join(all_columns)
         )
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a data architect."},
-                    {"role": "user", "content": prompt},
-                ],
-                response_model=None,
-                max_tokens=500,
-                temperature=0.1,
-            )
-
-            # Parse response
-            content = response.choices[0].message.content
-            pruned_data = json.loads(content)
-            required_columns = pruned_data.get("required_columns", [])
-
-            # Map back to dataset structure
-            result = {}
-            for col_ref in required_columns:
-                if "." in col_ref:
-                    dataset, col = col_ref.split(".", 1)
-                    if dataset not in result:
-                        result[dataset] = []
-                    result[dataset].append(col)
-
-            return result
-
-        except Exception as e:
-            # Fallback: return all columns
-            print(f"Schema pruning failed: {e}. Using all columns.")
-            return evidence_headers
+        # Use Instructor to guarantee the output matches PrunedSchema
+        return self.client.chat.completions.create(
+            model=self.model,
+            response_model=PrunedSchema,  # <--- FIX: Use Pydantic here
+            messages=[
+                {"role": "system", "content": "You are a banking data architect."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=500,
+            temperature=0.1,
+            max_retries=2,  # Automatic self-correction if it hallucinates format
+        )
 
     def _generate_dsl(
         self,
@@ -188,16 +176,20 @@ class AITranslator:
         evidence_headers: Dict[str, List[str]],
     ) -> EnterpriseControlDSL:
         """
-        Second LLM pass: Generate DSL with Pydantic validation.
+        Second LLM pass: Generate DSL with Pydantic validation and auto-retry.
         """
+        import json  # Only used for dumping the dictionary to the prompt string
+
         prompt = DSL_GENERATION_PROMPT.format(
             control_text=control_text,
             selected_columns_with_types=json.dumps(pruned_columns, indent=2),
             dataset_aliases=list(evidence_headers.keys()),
         )
 
-        # Use Instructor with JSON mode to avoid function calling wrapping issues
-        dsl = self.client.chat.completions.create(
+        # Let Instructor handle the heavy lifting.
+        # If the LLM generates an invalid operator, Instructor will catch it,
+        # append the error to the prompt, and try again up to 3 times.
+        return self.client.chat.completions.create(
             model=self.model,
             response_model=EnterpriseControlDSL,
             messages=[
@@ -206,9 +198,8 @@ class AITranslator:
             ],
             max_tokens=4000,
             temperature=0.1,
+            max_retries=3,  # <--- FIX: This replaces your manual try/except loop!
         )
-
-        return dsl
 
 
 class MockAITranslator:

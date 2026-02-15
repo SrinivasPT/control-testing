@@ -3,11 +3,12 @@ Evidence Ingestion Module
 Converts Excel to Parquet with SHA-256 hashing and source metadata
 """
 
-import pandas as pd
 import hashlib
-from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
 
 
 class EvidenceIngestion:
@@ -95,19 +96,21 @@ class EvidenceIngestion:
             if any(keyword in col.lower() for keyword in ["id", "code", "number"]):
                 df[col] = df[col].astype(str)
 
-        # Convert datetime columns to ISO format strings
-        for col in df.select_dtypes(include=["datetime64"]).columns:
+        # Force valid dates, but LEAVE THEM AS NATIVE DATETIME OBJECTS
+        # so PyArrow writes them as Parquet Timestamps, not Varchar strings.
+        for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
-            df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Convert date columns
-        date_cols = [c for c in df.columns if "date" in c.lower()]
+        # Catch hidden string dates in 'date' columns
+        date_cols = [
+            c for c in df.columns if "date" in c.lower() and df[c].dtype == "object"
+        ]
         for col in date_cols:
             try:
+                # Infer datetime formats, coerce errors to NaT
                 df[col] = pd.to_datetime(df[col], errors="coerce")
-                df[col] = df[col].dt.strftime("%Y-%m-%d")
-            except:
-                pass
+            except Exception:
+                pass  # Leave as string if it completely fails to parse
 
         return df
 

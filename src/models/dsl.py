@@ -74,15 +74,15 @@ class FilterIsNull(BaseModel):
 
 
 class JoinLeft(BaseModel):
-    """Left join two datasets"""
+    """Left join two datasets on one or more keys (supports composite joins)"""
 
     model_config = ConfigDict(extra="forbid")
 
     operation: Literal["join_left"] = "join_left"
     left_dataset: str
     right_dataset: str
-    left_key: str
-    right_key: str
+    left_keys: List[str]  # Changed from single key to list for composite joins
+    right_keys: List[str]  # Changed from single key to list for composite joins
 
 
 # Unified Pipeline Action (Discriminated Union with proper Pydantic v2 syntax)
@@ -147,6 +147,10 @@ class ValueMatchAssertion(BaseAssertion):
     field: str
     operator: Literal["eq", "neq", "gt", "lt", "gte", "lte", "in", "not_in"]
     expected_value: Union[str, int, float, bool, None, List[str], List[int]]
+    ignore_case_and_space: bool = Field(
+        default=True,
+        description="If true, compiler will trim and upper-case both sides before comparing strings.",
+    )
 
 
 class TemporalSequenceAssertion(BaseAssertion):
@@ -157,7 +161,7 @@ class TemporalSequenceAssertion(BaseAssertion):
 
 
 class AggregationSumAssertion(BaseAssertion):
-    """Aggregation-level assertion"""
+    """Aggregation-level assertion (DEPRECATED - use AggregationAssertion)"""
 
     assertion_type: Literal["aggregation_sum"] = "aggregation_sum"
     group_by_fields: List[str] = Field(
@@ -169,9 +173,49 @@ class AggregationSumAssertion(BaseAssertion):
     threshold: float
 
 
+class AggregationAssertion(BaseAssertion):
+    """Generalized aggregation assertion supporting SUM, COUNT, AVG, MIN, MAX"""
+
+    assertion_type: Literal["aggregation"] = "aggregation"
+    group_by_fields: List[str] = Field(
+        ...,
+        description="Columns to group by. MUST include the primary key if checking per-entity limits.",
+    )
+    metric_field: str
+    aggregation_function: Literal["SUM", "COUNT", "AVG", "MIN", "MAX"]
+    operator: Literal["gt", "lt", "eq", "gte", "lte"]
+    threshold: float
+
+
+class TemporalDateMathAssertion(BaseAssertion):
+    """Assertion for comparing a date to another date + an offset in days"""
+
+    assertion_type: Literal["temporal_date_math"] = "temporal_date_math"
+    base_date_field: str  # The date field being checked (e.g., edd_completion_date)
+    operator: Literal["gt", "lt", "eq", "gte", "lte"]
+    target_date_field: str  # The reference date field (e.g., onboarding_date)
+    offset_days: int  # Days to add to target_date_field
+
+
+class ColumnComparisonAssertion(BaseAssertion):
+    """Compares two dynamic columns against each other (e.g., trade_date > clearance_date)"""
+
+    assertion_type: Literal["column_comparison"] = "column_comparison"
+    left_field: str
+    operator: Literal["eq", "neq", "gt", "lt", "gte", "lte"]
+    right_field: str
+
+
 # Unified Assertion Type (Discriminated Union with proper Pydantic v2 syntax)
 Assertion = Annotated[
-    Union[ValueMatchAssertion, TemporalSequenceAssertion, AggregationSumAssertion],
+    Union[
+        ValueMatchAssertion,
+        TemporalSequenceAssertion,
+        AggregationSumAssertion,  # Kept for backwards compatibility
+        AggregationAssertion,
+        TemporalDateMathAssertion,
+        ColumnComparisonAssertion,
+    ],
     Field(discriminator="assertion_type"),
 ]
 

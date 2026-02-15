@@ -218,8 +218,8 @@ def test_scenario_2_cross_system_join(ingested_data, execution_engine):
                         "operation": "join_left",
                         "left_dataset": "trades_sheet1",
                         "right_dataset": "hr_roster_sheet1",
-                        "left_key": "approver_id",
-                        "right_key": "employee_id",
+                        "left_keys": ["approver_id"],
+                        "right_keys": ["employee_id"],
                     },
                 },
                 {

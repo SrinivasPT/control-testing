@@ -294,3 +294,8 @@ Proprietary - Enterprise Compliance System
 ## Support
 
 For questions or issues, contact the compliance engineering team.
+
+## Notes
+``` bash
+python -m src.orchestrator --input data/input
+```

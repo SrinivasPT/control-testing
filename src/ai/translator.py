@@ -67,19 +67,76 @@ CRITICAL RULES:
 2. Do NOT invent operators - use only from allowed enums
 3. Map business terms to technical fields using ontology_bindings
 4. For row-level checks, use ValueMatchAssertion with assertion_type="value_match"
-5. For aggregations (SUM, AVG, COUNT), use AggregationSumAssertion with assertion_type="aggregation_sum"
+5. For aggregations (SUM, AVG, COUNT, MIN, MAX), use AggregationAssertion with assertion_type="aggregation"
 6. Include materiality thresholds (typically 0.0 for binary checks)
 7. DO NOT wrap the result in a "control" key - return the fields directly at the top level
+
+8. **CRITICAL - Qualified Column Names in Joins:**
+   - When referencing a column from a JOINED dataset in an assertion, you MUST prefix it with the dataset alias
+   - Example: Use "ofac_watch_list_sheet1.tax_id" instead of just "tax_id" after joining
+   - For columns from the base dataset, you can use the unqualified name
+
+9. **CRITICAL - Composite Joins:**
+   - JoinLeft now accepts "left_keys" and "right_keys" as LISTS, not single strings
+   - To join on multiple columns, use: "left_keys": ["employee_id", "ticker_symbol"]
+   - NEVER use a filter to complete a join - use composite keys in the join itself
+
+10. **CRITICAL - NULL Handling in Left Joins:**
+    - When doing a LEFT JOIN to check restrictions, if the absence of a record means compliance, 
+      you MUST add a population filter to exclude NULL results from the joined table
+    - Example: After joining to a sanctions list, filter WHERE sanctions_list.id IS NOT NULL to only check matched records
+
+11. **CRITICAL - Date Math:**
+    - For date comparisons like "within X days", use TemporalDateMathAssertion
+    - assertion_type: "temporal_date_math"
+    - Example: Check if EDD completed within 14 days of onboarding
+      {
+        "assertion_type": "temporal_date_math",
+        "base_date_field": "edd_completion_date",
+        "operator": "lte",
+        "target_date_field": "onboarding_date",
+        "offset_days": 14
+      }
+
+12. **CRITICAL - Column-to-Column Comparisons:**
+    - For comparing two dynamic columns (not static values), use ColumnComparisonAssertion
+    - assertion_type: "column_comparison"
+    - Example: Check if trade_date > clearance_date
+      {
+        "assertion_type": "column_comparison",
+        "left_field": "trade_date",
+        "operator": "gt",
+        "right_field": "clearance_date"
+      }
+
+13. **Case-Insensitive String Matching:**
+    - ValueMatchAssertion has "ignore_case_and_space": true by default
+    - This handles variations like "APPROVED" vs "Approved" vs " approved "
+    - Only set to false if exact case matching is required
 
 ALLOWED OPERATORS:
 - Filter: eq, neq, gt, lt, gte, lte
 - ValueMatch: eq, neq, gt, lt, gte, lte, in, not_in
 - Aggregation: gt, lt, eq, gte, lte
+- ColumnComparison: eq, neq, gt, lt, gte, lte
+- TemporalDateMath: gt, lt, eq, gte, lte
+
+ASSERTION TYPES AVAILABLE:
+- value_match: Compare field to static value
+- column_comparison: Compare two fields to each other
+- temporal_date_math: Compare date field to another date + offset
+- temporal_sequence: Ensure chronological order of events
+- aggregation: SUM/COUNT/AVG/MIN/MAX with HAVING clause
+- aggregation_sum: (DEPRECATED - use aggregation instead)
 
 EXAMPLE:
 If control says "Ensure all trades over $10k are approved":
 - Create FilterComparison step: notional_usd > 10000
 - Create ValueMatchAssertion: approval_status == "APPROVED"
+
+If control says "Employee can't trade within 30 days of wall-cross":
+- Create JoinLeft with composite keys: ["employee_id", "ticker_symbol"]
+- Create TemporalDateMathAssertion: trade_date >= wall_cross_date + 30 days
 """
 
 

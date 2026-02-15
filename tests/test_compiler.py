@@ -4,14 +4,11 @@ Tests CTE chaining, value escaping, and assertion compilation
 """
 
 import pytest
+
+from src.compiler.sql_compiler import ControlCompiler
 from src.models.dsl import (
     EnterpriseControlDSL,
-    ControlGovernance,
-    PopulationPipeline,
-    ValueMatchAssertion,
-    EvidenceRequirements,
 )
-from src.compiler.sql_compiler import ControlCompiler
 
 
 def test_quote_value_escapes_single_quotes():
@@ -77,8 +74,9 @@ def test_simple_value_match_compilation():
 
     sql = compiler.compile_to_sql(manifests)
 
-    # Should find exceptions (rows where NOT status = 'APPROVED')
-    assert "NOT (status = 'APPROVED')" in sql
+    # Should find exceptions with case-insensitive comparison (new behavior)
+    assert "TRIM(UPPER(CAST(status AS VARCHAR)))" in sql
+    assert "TRIM(UPPER('APPROVED'))" in sql
     assert "read_parquet('/tmp/test.parquet')" in sql
 
 
@@ -156,8 +154,8 @@ def test_cte_chaining_with_multiple_steps():
                         "operation": "join_left",
                         "left_dataset": "trades",
                         "right_dataset": "hr_roster",
-                        "left_key": "approver_id",
-                        "right_key": "employee_id",
+                        "left_keys": ["approver_id"],
+                        "right_keys": ["employee_id"],
                     },
                 },
             ],

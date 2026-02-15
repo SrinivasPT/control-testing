@@ -7,11 +7,14 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from src.models.dsl import (
+    AggregationAssertion,
     AggregationSumAssertion,
+    ColumnComparisonAssertion,
     EnterpriseControlDSL,
     FilterComparison,
     FilterInList,
     FilterIsNull,
+    TemporalDateMathAssertion,
     TemporalSequenceAssertion,
     ValueMatchAssertion,
 )
@@ -86,11 +89,24 @@ class ControlCompiler:
 
             elif action.operation == "join_left":
                 right_path = manifests[action.right_dataset]["parquet_path"]
-                # CRITICAL FIX: Reference previous step, not always 'base'
+
+                # Build composite join conditions (supports multiple keys)
+                join_conditions = []
+                for l_key, r_key in zip(action.left_keys, action.right_keys):
+                    join_conditions.append(
+                        f"{previous_alias}.{l_key} = right_tbl.{r_key}"
+                    )
+
+                on_clause = " AND ".join(join_conditions)
+
+                # CRITICAL FIX: Use qualified SELECT to avoid ambiguous column names
+                # Select all columns from left, and only new columns from right
                 join_cte = f"""{step.step_id} AS (
-    SELECT * FROM {previous_alias}
+    SELECT {previous_alias}.*,
+           right_tbl.*
+    FROM {previous_alias}
     LEFT JOIN read_parquet('{right_path}') AS right_tbl
-    ON {previous_alias}.{action.left_key} = right_tbl.{action.right_key}
+    ON {on_clause}
 )"""
                 self.cte_fragments.append(join_cte)
                 # Update the pointer to current step for next iteration
@@ -137,7 +153,17 @@ class ControlCompiler:
                 cond = self._compile_temporal_sequence(assertion)
                 self.assertion_exceptions.append(f"NOT ({cond})")
 
-            elif isinstance(assertion, AggregationSumAssertion):
+            elif isinstance(assertion, TemporalDateMathAssertion):
+                # Temporal date math → WHERE clause
+                cond = self._compile_temporal_date_math(assertion)
+                self.assertion_exceptions.append(f"NOT ({cond})")
+
+            elif isinstance(assertion, ColumnComparisonAssertion):
+                # Column-to-column comparison → WHERE clause
+                cond = self._compile_column_comparison(assertion)
+                self.assertion_exceptions.append(f"NOT ({cond})")
+
+            elif isinstance(assertion, (AggregationSumAssertion, AggregationAssertion)):
                 # Aggregation assertion → HAVING clause
                 cond = self._compile_aggregation(assertion)
                 self.having_conditions.append(f"NOT ({cond})")
@@ -148,6 +174,17 @@ class ControlCompiler:
         field = assertion.field
         operator = assertion.operator
         value = assertion.expected_value
+
+        # CRITICAL FIX: Handle SQL NULL semantics
+        if value is None:
+            if operator == "eq":
+                return f"{field} IS NULL"
+            elif operator == "neq":
+                return f"{field} IS NOT NULL"
+            else:
+                raise ValueError(
+                    f"Operator {operator} invalid for NULL comparison. Use 'eq' for IS NULL or 'neq' for IS NOT NULL."
+                )
 
         # Map DSL operators to SQL operators
         op_map = {
@@ -169,6 +206,15 @@ class ControlCompiler:
                 values_str = ", ".join([self._quote_value(v) for v in value])
                 return f"{field} {sql_op} ({values_str})"
 
+        # CRITICAL FIX: Handle case-insensitive string comparison
+        if (
+            getattr(assertion, "ignore_case_and_space", True)
+            and isinstance(value, str)
+            and operator not in ["in", "not_in"]
+        ):
+            # Trim and uppercase both sides for string comparisons
+            return f"TRIM(UPPER(CAST({field} AS VARCHAR))) {sql_op} TRIM(UPPER({self._quote_value(value)}))"
+
         # Handle scalar values
         return f"{field} {sql_op} {self._quote_value(value)}"
 
@@ -183,8 +229,31 @@ class ControlCompiler:
 
         return " AND ".join(conditions)
 
-    def _compile_aggregation(self, assertion: AggregationSumAssertion) -> str:
-        """Translates AggregationSumAssertion to SQL HAVING condition"""
+    def _compile_temporal_date_math(self, assertion: TemporalDateMathAssertion) -> str:
+        """Translates TemporalDateMathAssertion to SQL with INTERVAL arithmetic"""
+        op_map = {"gt": ">", "lt": "<", "eq": "=", "gte": ">=", "lte": "<="}
+        sql_op = op_map[assertion.operator]
+
+        # Translates to: edd_date <= onboarding_date + INTERVAL 14 DAY
+        return f"{assertion.base_date_field} {sql_op} {assertion.target_date_field} + INTERVAL {assertion.offset_days} DAY"
+
+    def _compile_column_comparison(self, assertion: ColumnComparisonAssertion) -> str:
+        """Translates ColumnComparisonAssertion to SQL (compares two columns)"""
+        op_map = {
+            "eq": "=",
+            "neq": "!=",
+            "gt": ">",
+            "lt": "<",
+            "gte": ">=",
+            "lte": "<=",
+        }
+        sql_op = op_map[assertion.operator]
+
+        # Notice we DO NOT use self._quote_value() here, because right_field is a column name!
+        return f"{assertion.left_field} {sql_op} {assertion.right_field}"
+
+    def _compile_aggregation(self, assertion) -> str:
+        """Translates Aggregation assertions to SQL HAVING condition"""
         metric = assertion.metric_field
         operator = assertion.operator
         threshold = assertion.threshold
@@ -192,7 +261,14 @@ class ControlCompiler:
         op_map = {"gt": ">", "lt": "<", "eq": "=", "gte": ">=", "lte": "<="}
         sql_op = op_map[operator]
 
-        return f"SUM({metric}) {sql_op} {threshold}"
+        # Determine aggregation function
+        if isinstance(assertion, AggregationAssertion):
+            agg_func = assertion.aggregation_function
+        else:
+            # Backward compatibility for AggregationSumAssertion
+            agg_func = "SUM"
+
+        return f"{agg_func}({metric}) {sql_op} {threshold}"
 
     def _build_sampling_clause(self) -> str:
         """Builds DuckDB specific TABLESAMPLE clause"""

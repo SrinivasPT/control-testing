@@ -193,7 +193,11 @@ class AuditFabric:
         )
 
         self.conn.commit()
-        return cursor.lastrowid
+        manifest_id = cursor.lastrowid
+
+        if manifest_id is None:
+            raise RuntimeError("Failed to retrieve manifest_id after insert")
+        return manifest_id
 
     def save_execution(self, report: Dict[str, Any]) -> None:
         """

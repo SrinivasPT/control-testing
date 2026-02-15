@@ -5,12 +5,13 @@ Tests discriminated unions and validation
 
 import pytest
 from pydantic import ValidationError
+
 from src.models.dsl import (
+    AggregationSumAssertion,
     EnterpriseControlDSL,
     FilterComparison,
     JoinLeft,
     ValueMatchAssertion,
-    AggregationSumAssertion,
 )
 
 
@@ -41,8 +42,8 @@ def test_join_left_discriminated_union():
         operation="join_left",
         left_dataset="trades",
         right_dataset="hr",
-        left_key="approver_id",
-        right_key="employee_id",
+        left_keys=["approver_id"],
+        right_keys=["employee_id"],
     )
 
     assert action.operation == "join_left"

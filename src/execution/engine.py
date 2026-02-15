@@ -49,6 +49,21 @@ class ExecutionEngine:
             # Calculate population size
             total_population = self._get_population_count(manifests, dsl, compiler)
 
+            # CRITICAL SAFEGUARD: Detect empty data feeds
+            if total_population == 0:
+                return {
+                    "control_id": dsl.governance.control_id,
+                    "verdict": "ERROR",
+                    "error_message": "Zero Population: The base dataset contains 0 rows after filters. Cannot attest to control effectiveness. Possible upstream data feed failure.",
+                    "exception_count": 0,
+                    "total_population": 0,
+                    "execution_query": sql,
+                    "evidence_hashes": {
+                        alias: meta["sha256_hash"] for alias, meta in manifests.items()
+                    },
+                    "executed_at": datetime.now().isoformat(),
+                }
+
             # Calculate exception rate
             exception_rate = (
                 (exception_count / total_population * 100)

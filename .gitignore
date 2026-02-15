@@ -107,5 +107,18 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
-# Scrap folder
-scrap/
+# Database files
+*.db
+*.sqlite3
+
+# Logs
+logs/
+data/logs/
+
+# Test data
+data/test_parquet/
+data/parquet/
+
+# Additional environment files
+.env.local
+.env.*.local

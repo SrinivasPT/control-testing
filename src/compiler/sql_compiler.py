@@ -353,7 +353,9 @@ class ControlCompiler:
             # Find the metric field from assertions
             metric_field = None
             for assertion in self.dsl.assertions:
-                if isinstance(assertion, AggregationSumAssertion):
+                if isinstance(
+                    assertion, (AggregationSumAssertion, AggregationAssertion)
+                ):
                     metric_field = self._normalize_field_name(assertion.metric_field)
                     break
 

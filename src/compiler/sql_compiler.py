@@ -18,12 +18,17 @@ from src.models.dsl import (
     TemporalSequenceAssertion,
     ValueMatchAssertion,
 )
+from src.utils.logging_config import get_logger
+
+# Get logger for this module
+logger = get_logger(__name__)
 
 
 class ControlCompiler:
     """Compiles DSL into DuckDB SQL with exception detection logic"""
 
     def __init__(self, dsl: EnterpriseControlDSL):
+        logger.debug(f"Initializing ControlCompiler for {dsl.governance.control_id}")
         self.dsl = dsl
         self.population_filters: List[str] = []  # MUST be true (AND)
         self.assertion_exceptions: List[
@@ -32,6 +37,20 @@ class ControlCompiler:
         self.having_conditions: List[str] = []
         self.group_by_fields: List[str] = []
         self.cte_fragments: List[str] = []
+
+    @staticmethod
+    def _normalize_field_name(field: str) -> str:
+        """
+        Strip dataset prefix from field names.
+        Example: 'wall_cross_register_sheet1.employee_id' -> 'employee_id'
+
+        This is necessary because after joins, columns are accessed by their base name,
+        not dataset.column notation.
+        """
+        if "." in field:
+            # Return everything after the last dot
+            return field.split(".")[-1]
+        return field
 
     def compile_to_sql(self, parquet_manifests: Dict[str, Dict[str, Any]]) -> str:
         """
@@ -99,8 +118,9 @@ class ControlCompiler:
 
                 on_clause = " AND ".join(join_conditions)
 
-                # CRITICAL FIX: Use qualified SELECT to avoid ambiguous column names
-                # Select all columns from left, and only new columns from right
+                # CRITICAL FIX: Don't prefix columns to avoid ambiguity
+                # After join, columns are accessed by their base name, not dataset.column
+                # The DSL should not include dataset prefixes in field references after joins
                 join_cte = f"""{step.step_id} AS (
     SELECT {previous_alias}.*,
            right_tbl.*
@@ -125,19 +145,22 @@ class ControlCompiler:
             "lte": "<=",
         }
         sql_op = op_map[action.operator]
-        return f"{action.field} {sql_op} {self._quote_value(action.value)}"
+        field = self._normalize_field_name(action.field)
+        return f"{field} {sql_op} {self._quote_value(action.value)}"
 
     def _compile_filter_in_list(self, action: FilterInList) -> str:
         """Compiles FilterInList to SQL IN condition"""
+        field = self._normalize_field_name(action.field)
         values_str = ", ".join([self._quote_value(v) for v in action.values])
-        return f"{action.field} IN ({values_str})"
+        return f"{field} IN ({values_str})"
 
     def _compile_filter_is_null(self, action: FilterIsNull) -> str:
         """Compiles FilterIsNull to SQL IS NULL condition"""
+        field = self._normalize_field_name(action.field)
         if action.is_null:
-            return f"{action.field} IS NULL"
+            return f"{field} IS NULL"
         else:
-            return f"{action.field} IS NOT NULL"
+            return f"{field} IS NOT NULL"
 
     def _compile_assertions(self) -> None:
         """Routes assertions to appropriate SQL clauses"""
@@ -167,11 +190,15 @@ class ControlCompiler:
                 # Aggregation assertion → HAVING clause
                 cond = self._compile_aggregation(assertion)
                 self.having_conditions.append(f"NOT ({cond})")
-                self.group_by_fields.extend(assertion.group_by_fields)
+                # Normalize group_by_fields to strip dataset prefixes
+                normalized_fields = [
+                    self._normalize_field_name(f) for f in assertion.group_by_fields
+                ]
+                self.group_by_fields.extend(normalized_fields)
 
     def _compile_value_match(self, assertion: ValueMatchAssertion) -> str:
         """Translates ValueMatchAssertion to SQL condition"""
-        field = assertion.field
+        field = self._normalize_field_name(assertion.field)
         operator = assertion.operator
         value = assertion.expected_value
 
@@ -223,8 +250,8 @@ class ControlCompiler:
         # Build chain: event1 < event2 < event3 ...
         conditions = []
         for i in range(len(assertion.event_chain) - 1):
-            event1 = assertion.event_chain[i]
-            event2 = assertion.event_chain[i + 1]
+            event1 = self._normalize_field_name(assertion.event_chain[i])
+            event2 = self._normalize_field_name(assertion.event_chain[i + 1])
             conditions.append(f"{event1} < {event2}")
 
         return " AND ".join(conditions)
@@ -234,8 +261,12 @@ class ControlCompiler:
         op_map = {"gt": ">", "lt": "<", "eq": "=", "gte": ">=", "lte": "<="}
         sql_op = op_map[assertion.operator]
 
-        # Translates to: edd_date <= onboarding_date + INTERVAL 14 DAY
-        return f"{assertion.base_date_field} {sql_op} {assertion.target_date_field} + INTERVAL {assertion.offset_days} DAY"
+        # CRITICAL FIX: Cast date fields to DATE type to handle VARCHAR/string dates
+        # Also normalize field names to strip dataset prefixes
+        base_field = self._normalize_field_name(assertion.base_date_field)
+        target_field = self._normalize_field_name(assertion.target_date_field)
+        # Translates to: CAST(edd_date AS DATE) <= CAST(onboarding_date AS DATE) + INTERVAL 14 DAY
+        return f"CAST({base_field} AS DATE) {sql_op} CAST({target_field} AS DATE) + INTERVAL {assertion.offset_days} DAY"
 
     def _compile_column_comparison(self, assertion: ColumnComparisonAssertion) -> str:
         """Translates ColumnComparisonAssertion to SQL (compares two columns)"""
@@ -249,12 +280,15 @@ class ControlCompiler:
         }
         sql_op = op_map[assertion.operator]
 
+        # Normalize both field names to strip dataset prefixes
+        left_field = self._normalize_field_name(assertion.left_field)
+        right_field = self._normalize_field_name(assertion.right_field)
         # Notice we DO NOT use self._quote_value() here, because right_field is a column name!
-        return f"{assertion.left_field} {sql_op} {assertion.right_field}"
+        return f"{left_field} {sql_op} {right_field}"
 
     def _compile_aggregation(self, assertion) -> str:
         """Translates Aggregation assertions to SQL HAVING condition"""
-        metric = assertion.metric_field
+        metric = self._normalize_field_name(assertion.metric_field)
         operator = assertion.operator
         threshold = assertion.threshold
 
@@ -318,7 +352,7 @@ class ControlCompiler:
             metric_field = None
             for assertion in self.dsl.assertions:
                 if isinstance(assertion, AggregationSumAssertion):
-                    metric_field = assertion.metric_field
+                    metric_field = self._normalize_field_name(assertion.metric_field)
                     break
 
             select_sql = f"""

@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from src.utils.logging_config import get_logger
+
+# Get logger for this module
+logger = get_logger(__name__)
+
 
 class EvidenceIngestion:
     """
@@ -18,8 +23,10 @@ class EvidenceIngestion:
     """
 
     def __init__(self, storage_dir: str = "data/parquet"):
+        logger.info(f"Initializing EvidenceIngestion with storage_dir={storage_dir}")
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Storage directory ready: {self.storage_dir.absolute()}")
 
     def ingest_excel_to_parquet(
         self,
@@ -40,18 +47,31 @@ class EvidenceIngestion:
         Returns:
             List of manifests with parquet_path, sha256_hash, source metadata
         """
+        logger.info(f"Starting ingestion of {excel_path}")
+        logger.debug(
+            f"Dataset prefix: {dataset_prefix}, source system: {source_system}"
+        )
         path = Path(excel_path)
 
         if not path.exists():
+            logger.error(f"Excel file not found: {excel_path}")
             raise FileNotFoundError(f"Excel file not found: {excel_path}")
 
         # Load all sheets
+        logger.debug(f"Loading Excel file: {path.name}")
         sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+        logger.info(f"Loaded {len(sheets)} sheet(s) from {path.name}")
         manifests = []
 
         for sheet_name, df in sheets.items():
+            logger.debug(
+                f"Processing sheet: {sheet_name} ({len(df)} rows, {len(df.columns)} columns)"
+            )
             # 1. Sanitize column names
             df.columns = [str(c).strip().replace(" ", "_").lower() for c in df.columns]
+            logger.debug(
+                f"Sanitized columns: {list(df.columns)[:10]}..."
+            )  # Show first 10
 
             # 2. Type casting to prevent DuckDB schema inference errors
             df = self._cast_types(df)
@@ -59,13 +79,17 @@ class EvidenceIngestion:
             # 3. Save to Parquet
             sanitized_sheet = sheet_name.replace(" ", "_").lower()
             out_path = self.storage_dir / f"{dataset_prefix}_{sanitized_sheet}.parquet"
+            logger.debug(f"Saving to Parquet: {out_path.name}")
             df.to_parquet(out_path, index=False, engine="pyarrow")
 
             # 4. Generate SHA-256 hash of physical file
+            logger.debug("Calculating SHA-256 hash")
             file_hash = self._hash_file(out_path)
+            logger.debug(f"Hash: {file_hash[:16]}...")
 
             # 5. Calculate schema version hash
             schema_version = self._calculate_schema_version(df)
+            logger.debug(f"Schema version: {schema_version}")
 
             manifests.append(
                 {
@@ -83,7 +107,12 @@ class EvidenceIngestion:
                     "columns": list(df.columns),
                 }
             )
+            logger.info(
+                f"Sheet {sheet_name} ingested: {len(df)} rows, "
+                f"hash={file_hash[:12]}..., schema_version={schema_version}"
+            )
 
+        logger.info(f"Ingestion complete: {len(manifests)} manifest(s) created")
         return manifests
 
     def _cast_types(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +120,7 @@ class EvidenceIngestion:
         Casts ambiguous types to avoid DuckDB errors.
         ID columns that Pandas infers as int64 should be strings.
         """
+        logger.debug("Casting data types for DuckDB compatibility")
         for col in df.columns:
             # Cast ID/Code columns to string
             if any(keyword in col.lower() for keyword in ["id", "code", "number"]):
@@ -139,6 +169,7 @@ class EvidenceIngestion:
         Extracts column headers from Excel without loading full data.
         Used for AI schema pruning.
         """
+        logger.debug(f"Extracting column headers from {excel_path}")
         path = Path(excel_path)
         sheets = pd.read_excel(path, sheet_name=None, nrows=0, engine="openpyxl")
 

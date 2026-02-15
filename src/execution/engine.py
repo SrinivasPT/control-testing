@@ -10,6 +10,10 @@ import duckdb
 
 from src.compiler.sql_compiler import ControlCompiler
 from src.models.dsl import EnterpriseControlDSL
+from src.utils.logging_config import get_logger
+
+# Get logger for this module
+logger = get_logger(__name__)
 
 
 class ExecutionEngine:
@@ -19,10 +23,13 @@ class ExecutionEngine:
     """
 
     def __init__(self, db_path: str = ":memory:"):
+        logger.info(f"Initializing ExecutionEngine with db_path={db_path}")
         self.conn = duckdb.connect(db_path)
         # Enable Parquet extensions
+        logger.debug("Installing and loading Parquet extension")
         self.conn.execute("INSTALL parquet")
         self.conn.execute("LOAD parquet")
+        logger.info("ExecutionEngine initialized successfully")
 
     def execute_control(
         self, dsl: EnterpriseControlDSL, manifests: Dict[str, Dict[str, Any]]
@@ -37,20 +44,34 @@ class ExecutionEngine:
         Returns:
             Execution report with verdict, exceptions, and audit metadata
         """
+        logger.info(f"Executing control: {dsl.governance.control_id}")
+        logger.debug(f"Manifests: {list(manifests.keys())}")
+
         # Compile DSL to SQL
+        logger.debug("Compiling DSL to SQL")
         compiler = ControlCompiler(dsl)
         sql = compiler.compile_to_sql(manifests)
+        logger.debug(f"SQL compilation complete, query length: {len(sql)} chars")
 
         try:
             # Execute query (DuckDB streams from disk - no RAM bloat)
+            logger.debug("Executing SQL query via DuckDB")
             result = self.conn.execute(sql).df()
             exception_count = len(result)
+            logger.info(
+                f"Query executed successfully, {exception_count} exceptions found"
+            )
 
             # Calculate population size
+            logger.debug("Calculating population count")
             total_population = self._get_population_count(manifests, dsl, compiler)
+            logger.info(f"Total population: {total_population}")
 
             # CRITICAL SAFEGUARD: Detect empty data feeds
             if total_population == 0:
+                logger.error(
+                    f"Zero population detected for control {dsl.governance.control_id}"
+                )
                 return {
                     "control_id": dsl.governance.control_id,
                     "verdict": "ERROR",
@@ -77,6 +98,12 @@ class ExecutionEngine:
             )
             verdict = "PASS" if exception_rate <= max_threshold else "FAIL"
 
+            logger.info(
+                f"Control {dsl.governance.control_id} executed: verdict={verdict}, "
+                f"exceptions={exception_count}/{total_population} ({exception_rate:.2f}%), "
+                f"threshold={max_threshold}%"
+            )
+
             return {
                 "control_id": dsl.governance.control_id,
                 "verdict": verdict,
@@ -93,6 +120,11 @@ class ExecutionEngine:
             }
 
         except Exception as e:
+            logger.error(
+                f"Execution error for control {dsl.governance.control_id}: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            logger.debug(f"Failed SQL query: {sql}")
             return {
                 "control_id": dsl.governance.control_id,
                 "verdict": "ERROR",
@@ -111,8 +143,10 @@ class ExecutionEngine:
         """
         Counts total rows in the population after filters but before assertions.
         """
+        logger.debug(f"Getting population count for {dsl.governance.control_id}")
         base_alias = dsl.population.base_dataset
         base_path = manifests[base_alias]["parquet_path"]
+        logger.debug(f"Base dataset: {base_alias}, path: {base_path}")
 
         # Use the strictly segregated population_filters from the updated compiler
         if hasattr(compiler, "population_filters") and compiler.population_filters:
@@ -125,10 +159,15 @@ class ExecutionEngine:
 
         try:
             result = self.conn.execute(count_sql).fetchone()
-            return result[0] if result is not None else 0
-        except Exception:
+            count = result[0] if result is not None else 0
+            logger.debug(f"Population count: {count}")
+            return count
+        except Exception as e:
             # Log the error in production, fallback to manifest count
-            return manifests[base_alias].get("row_count", 0)
+            logger.warning(f"Failed to get population count, using manifest count: {e}")
+            fallback_count = manifests[base_alias].get("row_count", 0)
+            logger.debug(f"Fallback count: {fallback_count}")
+            return fallback_count
 
     def validate_schema(
         self, manifests: Dict[str, Dict[str, Any]], dsl: EnterpriseControlDSL
@@ -137,9 +176,11 @@ class ExecutionEngine:
         Pre-flight schema validation: check if expected columns exist in Parquet.
         Returns validation result with missing columns if any.
         """
+        logger.debug(f"Validating schema for control {dsl.governance.control_id}")
         expected_columns = {
             binding.technical_field for binding in dsl.ontology_bindings
         }
+        logger.debug(f"Expected columns: {expected_columns}")
 
         validation_results = []
 
@@ -148,6 +189,9 @@ class ExecutionEngine:
             missing = expected_columns - actual_columns
 
             if missing:
+                logger.warning(
+                    f"Schema drift detected in {dataset_alias}: missing columns {missing}"
+                )
                 validation_results.append(
                     {
                         "dataset_alias": dataset_alias,
@@ -167,6 +211,8 @@ class ExecutionEngine:
             else "SCHEMA_DRIFT_DETECTED"
         )
 
+        logger.info(f"Schema validation complete: {overall_status}")
+
         return {
             "overall_status": overall_status,
             "dataset_validations": validation_results,
@@ -174,4 +220,6 @@ class ExecutionEngine:
 
     def close(self):
         """Close DuckDB connection"""
+        logger.info("Closing DuckDB connection")
         self.conn.close()
+        logger.debug("DuckDB connection closed")

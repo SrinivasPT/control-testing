@@ -3,12 +3,17 @@ AI Translation Module
 Schema pruning and DSL generation using OpenAI/Anthropic
 """
 
+import json
 import os
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.models.dsl import EnterpriseControlDSL
+from src.utils.logging_config import get_logger
+
+# Get logger for this module
+logger = get_logger(__name__)
 
 
 # NEW: Define a strict Pydantic model for the Pruning Pass
@@ -90,24 +95,24 @@ CRITICAL RULES:
     - For date comparisons like "within X days", use TemporalDateMathAssertion
     - assertion_type: "temporal_date_math"
     - Example: Check if EDD completed within 14 days of onboarding
-      {
+      {{
         "assertion_type": "temporal_date_math",
         "base_date_field": "edd_completion_date",
         "operator": "lte",
         "target_date_field": "onboarding_date",
         "offset_days": 14
-      }
+      }}
 
 12. **CRITICAL - Column-to-Column Comparisons:**
     - For comparing two dynamic columns (not static values), use ColumnComparisonAssertion
     - assertion_type: "column_comparison"
     - Example: Check if trade_date > clearance_date
-      {
+      {{
         "assertion_type": "column_comparison",
         "left_field": "trade_date",
         "operator": "gt",
         "right_field": "clearance_date"
-      }
+      }}
 
 13. **Case-Insensitive String Matching:**
     - ValueMatchAssertion has "ignore_case_and_space": true by default
@@ -148,11 +153,13 @@ class AITranslator:
 
     def __init__(self, api_key: Optional[str] = None, model: str = "deepseek-chat"):
         self.model = model
+        logger.info(f"Initializing AITranslator with model: {model}")
 
         try:
             import instructor
             from openai import OpenAI
         except ImportError:
+            logger.error("Instructor library not installed")
             raise ImportError(
                 "Instructor library not installed. "
                 "Run: pip install instructor openai pydantic"
@@ -161,16 +168,19 @@ class AITranslator:
         # Initialize DeepSeek client with Instructor (OpenAI-compatible API)
         api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
+            logger.error("DeepSeek API key not provided")
             raise ValueError(
                 "DeepSeek API key required. Set DEEPSEEK_API_KEY environment variable "
                 "or pass api_key parameter."
             )
 
         # Patch the OpenAI client with Instructor
+        logger.debug("Initializing OpenAI client with Instructor patch")
         self.client = instructor.from_openai(
             OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1"),
             mode=instructor.Mode.JSON,
         )
+        logger.info("AITranslator initialized successfully")
 
     def translate_control(
         self, control_text: str, evidence_headers: Dict[str, List[str]]
@@ -185,46 +195,87 @@ class AITranslator:
         Returns:
             Validated EnterpriseControlDSL
         """
-        # Pass 1: Schema pruning (Returns guaranteed Pydantic object)
-        pruned_schema_obj = self._prune_schema(control_text, evidence_headers)
+        logger.info("Starting two-pass AI translation")
+        logger.debug(f"Control text length: {len(control_text)} chars")
+        logger.debug(f"Evidence datasets: {list(evidence_headers.keys())}")
 
-        # Re-map the flat list back to dataset architecture
-        pruned_columns = {}
-        for col_ref in pruned_schema_obj.required_columns:
-            if "." in col_ref:
-                dataset, col = col_ref.split(".", 1)
-                if dataset not in pruned_columns:
-                    pruned_columns[dataset] = []
-                pruned_columns[dataset].append(col)
+        try:
+            # Pass 1: Schema pruning (Returns guaranteed Pydantic object)
+            logger.debug("Starting Pass 1: Schema pruning")
+            pruned_schema_obj = self._prune_schema(control_text, evidence_headers)
+            logger.info(
+                f"Schema pruned to {len(pruned_schema_obj.required_columns)} columns"
+            )
+            logger.debug(f"Pruned columns: {pruned_schema_obj.required_columns}")
 
-        # Pass 2: Generate DSL
-        # Instructor handles the retries and feeds validation errors back to the LLM automatically!
-        return self._generate_dsl(control_text, pruned_columns, evidence_headers)
+            # Re-map the flat list back to dataset architecture
+            pruned_columns = {}
+            for col_ref in pruned_schema_obj.required_columns:
+                if "." in col_ref:
+                    dataset, col = col_ref.split(".", 1)
+                    if dataset not in pruned_columns:
+                        pruned_columns[dataset] = []
+                    pruned_columns[dataset].append(col)
+
+            # Pass 2: Generate DSL
+            # Instructor handles the retries and feeds validation errors back to the LLM automatically!
+            logger.debug("Starting Pass 2: DSL generation")
+            dsl = self._generate_dsl(control_text, pruned_columns, evidence_headers)
+            logger.info(
+                f"DSL generation successful: control_id={dsl.governance.control_id}"
+            )
+            return dsl
+
+        except ValidationError as e:
+            logger.error(
+                f"Pydantic validation error during translation: {e}", exc_info=True
+            )
+            logger.error(f"Validation errors: {e.errors()}")
+            raise
+        except Exception as e:
+            logger.error(
+                f"Unexpected error during AI translation: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            raise
 
     def _prune_schema(
         self, control_text: str, evidence_headers: Dict[str, List[str]]
     ) -> PrunedSchema:
         """First LLM pass: Identify relevant columns using strict Pydantic extraction."""
+        logger.debug("Executing schema pruning pass")
         all_columns = []
         for dataset, cols in evidence_headers.items():
             all_columns.extend([f"{dataset}.{col}" for col in cols])
+
+        logger.debug(f"Total available columns: {len(all_columns)}")
 
         prompt = PRUNING_PROMPT.format(
             control_text=control_text, all_column_names=", ".join(all_columns)
         )
 
-        # Use Instructor to guarantee the output matches PrunedSchema
-        return self.client.chat.completions.create(
-            model=self.model,
-            response_model=PrunedSchema,  # <--- FIX: Use Pydantic here
-            messages=[
-                {"role": "system", "content": "You are a banking data architect."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-            temperature=0.1,
-            max_retries=2,  # Automatic self-correction if it hallucinates format
-        )
+        try:
+            # Use Instructor to guarantee the output matches PrunedSchema
+            result = self.client.chat.completions.create(
+                model=self.model,
+                response_model=PrunedSchema,  # <--- FIX: Use Pydantic here
+                messages=[
+                    {"role": "system", "content": "You are a banking data architect."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=500,
+                temperature=0.1,
+                max_retries=2,  # Automatic self-correction if it hallucinates format
+            )
+            logger.debug(
+                f"Schema pruning completed: {len(result.required_columns)} columns selected"
+            )
+            return result
+        except Exception as e:
+            logger.error(
+                f"Schema pruning failed: {type(e).__name__}: {e}", exc_info=True
+            )
+            raise
 
     def _generate_dsl(
         self,
@@ -235,7 +286,8 @@ class AITranslator:
         """
         Second LLM pass: Generate DSL with Pydantic validation and auto-retry.
         """
-        import json  # Only used for dumping the dictionary to the prompt string
+        logger.debug("Executing DSL generation pass")
+        logger.debug(f"Pruned columns for DSL: {pruned_columns}")
 
         prompt = DSL_GENERATION_PROMPT.format(
             control_text=control_text,
@@ -243,20 +295,58 @@ class AITranslator:
             dataset_aliases=list(evidence_headers.keys()),
         )
 
-        # Let Instructor handle the heavy lifting.
-        # If the LLM generates an invalid operator, Instructor will catch it,
-        # append the error to the prompt, and try again up to 3 times.
-        return self.client.chat.completions.create(
-            model=self.model,
-            response_model=EnterpriseControlDSL,
-            messages=[
-                {"role": "system", "content": "You are a compliance control compiler."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=4000,
-            temperature=0.1,
-            max_retries=3,  # <--- FIX: This replaces your manual try/except loop!
-        )
+        try:
+            # Let Instructor handle the heavy lifting.
+            # If the LLM generates an invalid operator, Instructor will catch it,
+            # append the error to the prompt, and try again up to 3 times.
+            logger.debug(f"Calling LLM for DSL generation (model: {self.model})")
+            result = self.client.chat.completions.create(
+                model=self.model,
+                response_model=EnterpriseControlDSL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a compliance control compiler.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=4000,
+                temperature=0.1,
+                max_retries=3,  # <--- FIX: This replaces your manual try/except loop!
+            )
+            logger.debug("DSL generation successful")
+            logger.debug(
+                f"Generated DSL: control_id={result.governance.control_id}, "
+                f"assertions={len(result.assertions)}, population_steps={len(result.population.steps)}"
+            )
+            return result
+
+        except ValidationError as e:
+            logger.error(
+                f"Pydantic validation failed during DSL generation: {e}", exc_info=True
+            )
+            logger.error(
+                f"Validation error details: {json.dumps(e.errors(), indent=2)}"
+            )
+            # Re-raise with more context
+            raise ValueError(f"AI generated invalid DSL structure: {e}") from e
+        except KeyError as e:
+            logger.error(f"KeyError during DSL generation: {e}", exc_info=True)
+            logger.error(
+                "This may indicate the AI returned a wrapped or malformed JSON structure"
+            )
+            # Try to provide more helpful error message
+            raise ValueError(
+                f"AI response parsing failed with KeyError: {e}. "
+                "The AI may have wrapped the DSL in an extra JSON layer. "
+                "Check the prompt and response format."
+            ) from e
+        except Exception as e:
+            logger.error(
+                f"Unexpected error during DSL generation: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            raise
 
 
 class MockAITranslator:
@@ -269,10 +359,13 @@ class MockAITranslator:
         self, control_text: str, evidence_headers: Dict[str, List[str]]
     ) -> EnterpriseControlDSL:
         """Returns a mock DSL for testing"""
+        logger.info("MockAITranslator called (no real API calls)")
+        logger.debug(f"Control text: {control_text[:100]}...")
 
         # Simple pattern matching for demo
         base_dataset = list(evidence_headers.keys())[0]
         columns = evidence_headers[base_dataset]
+        logger.debug(f"Using base dataset: {base_dataset} with {len(columns)} columns")
 
         # Create a simple value match assertion
         mock_dsl_dict = {

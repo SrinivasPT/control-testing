@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from src.utils.logging_config import get_logger
+
+# Get logger for this module
+logger = get_logger(__name__)
+
 
 def _sanitize_for_json(obj: Any) -> Any:
     """
@@ -37,14 +42,19 @@ class AuditFabric:
     """
 
     def __init__(self, db_path: str = "data/audit.db"):
+        logger.info(f"Initializing AuditFabric with db_path={db_path}")
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Database path: {self.db_path.absolute()}")
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+        logger.debug("Initializing database schema")
         self._init_schema()
+        logger.info("AuditFabric initialized successfully")
 
     def _init_schema(self):
         """Creates database schema if not exists"""
+        logger.debug("Creating database tables if not exist")
         cursor = self.conn.cursor()
 
         # Controls table
@@ -124,10 +134,13 @@ class AuditFabric:
             dsl: The EnterpriseControlDSL as dictionary
             approved_by: Username of approver
         """
-        cursor = self.conn.cursor()
-
         control_id = dsl["governance"]["control_id"]
         version = dsl["governance"]["version"]
+        logger.info(f"Saving control DSL: {control_id} v{version}")
+        logger.debug(f"Approved by: {approved_by}")
+
+        cursor = self.conn.cursor()
+
         owner_role = dsl["governance"]["owner_role"]
 
         cursor.execute(
@@ -150,6 +163,7 @@ class AuditFabric:
 
     def get_control(self, control_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves approved DSL by control_id"""
+        logger.debug(f"Retrieving control DSL for {control_id}")
         cursor = self.conn.cursor()
         cursor.execute(
             """
@@ -160,7 +174,9 @@ class AuditFabric:
 
         row = cursor.fetchone()
         if row:
+            logger.debug(f"Control {control_id} found in database")
             return json.loads(row["dsl_json"])
+        logger.debug(f"Control {control_id} not found in database")
         return None
 
     def save_evidence_manifest(self, manifest: Dict[str, Any]) -> int:
@@ -170,6 +186,7 @@ class AuditFabric:
         Returns:
             manifest_id
         """
+        logger.debug(f"Saving evidence manifest for {manifest['dataset_alias']}")
         cursor = self.conn.cursor()
 
         cursor.execute(
@@ -208,9 +225,17 @@ class AuditFabric:
         """
         import uuid
 
+        logger.info(
+            f"Saving execution report for control {report['control_id']}, verdict={report['verdict']}"
+        )
+        logger.debug(
+            f"Execution details: exceptions={report.get('exception_count', 0)}, population={report.get('total_population', 0)}"
+        )
+
         cursor = self.conn.cursor()
 
         execution_id = str(uuid.uuid4())
+        logger.debug(f"Generated execution_id: {execution_id}")
 
         cursor.execute(
             """
@@ -366,4 +391,6 @@ class AuditFabric:
 
     def close(self):
         """Close database connection"""
+        logger.info("Closing AuditFabric database connection")
         self.conn.close()
+        logger.debug("Database connection closed")

@@ -118,12 +118,14 @@ class ControlCompiler:
 
                 on_clause = " AND ".join(join_conditions)
 
-                # CRITICAL FIX: Don't prefix columns to avoid ambiguity
-                # After join, columns are accessed by their base name, not dataset.column
-                # The DSL should not include dataset prefixes in field references after joins
+                # CRITICAL FIX: Use DuckDB's EXCLUDE to prevent Ambiguous Column crashes
+                # When both tables have the same column names (like join keys), we exclude
+                # the duplicate columns from the right table to avoid SQL errors
+                exclude_keys = ", ".join(action.right_keys)
+
                 join_cte = f"""{step.step_id} AS (
     SELECT {previous_alias}.*,
-           right_tbl.*
+           right_tbl.* EXCLUDE ({exclude_keys})
     FROM {previous_alias}
     LEFT JOIN read_parquet('{right_path}') AS right_tbl
     ON {on_clause}

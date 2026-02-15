@@ -117,15 +117,43 @@ class EvidenceIngestion:
 
     def _cast_types(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Casts ambiguous types to avoid DuckDB errors.
-        ID columns that Pandas infers as int64 should be strings.
+        Casts ambiguous types and cleans dirty Excel formatting
+        to ensure pristine DuckDB execution.
+
+        This is Layer 2: The Data Quality Gate (Defense in Depth)
+        - Layer 1: Pre-processing (universal fixes)
+        - Layer 2: Quality Gate (type coercion, currency cleaning)
+        - Layer 3: SQL Validation (business logic)
         """
         logger.debug("Casting data types for DuckDB compatibility")
         for col in df.columns:
-            # Cast ID/Code columns to string
+            # 1. Cast ID/Code columns to string
             if any(keyword in col.lower() for keyword in ["id", "code", "number"]):
                 df[col] = df[col].astype(str)
+                continue
 
+            # 2. Clean Currency & Numeric columns (The DeepSeek Fix)
+            # Handle formats like "$12,345.67" or "€1.234,56" or "1,234.56"
+            # If the column is an object (string) but looks like currency
+            if df[col].dtype == "object":
+                # Check if column contains currency-like patterns
+                sample = df[col].dropna().astype(str).head(100)
+                if (
+                    len(sample) > 0
+                    and sample.str.match(r"^[\s$€£¥]*[\d,\.]+$", na=False).any()
+                ):
+                    logger.debug(
+                        f"Detected currency/numeric formatting in column: {col}"
+                    )
+                    # Strip currency symbols ($, £, €, ¥), spaces, and commas
+                    df[col] = (
+                        df[col].astype(str).str.replace(r"[^\d.-]", "", regex=True)
+                    )
+                    # Convert to numeric, coerce errors to NaN
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                    logger.debug(f"Cleaned {col}: converted to numeric")
+
+        # 3. Standardize Datetimes (Leave as native datetime for Parquet)
         # Force valid dates, but LEAVE THEM AS NATIVE DATETIME OBJECTS
         # so PyArrow writes them as Parquet Timestamps, not Varchar strings.
         for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
@@ -139,6 +167,7 @@ class EvidenceIngestion:
             try:
                 # Infer datetime formats, coerce errors to NaT
                 df[col] = pd.to_datetime(df[col], errors="coerce")
+                logger.debug(f"Converted date column: {col}")
             except Exception:
                 pass  # Leave as string if it completely fails to parse
 
